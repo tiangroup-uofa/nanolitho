@@ -744,7 +744,51 @@ density/ordering factorization is not just an implementation convenience,
 it is what makes "target microstructure/connectivity map → trajectory" a
 well-posed, low-sample problem at all.
 
-### 9.5 Division of labor for a follow-up paper
+### 9.5 Addendum: meshing as a continuous-surface constructor
+
+A correction to §9.1's framing, after closer reading of the parallel work:
+their meshing is not merely a slicing heuristic that discretizes a solid
+into per-layer dot sets. It is a genuinely powerful construction method for
+**continuously varying topographies — wave surfaces**: smoothly modulated
+height fields (sinusoidal/graded profiles, lens-like relief, diffractive
+surfaces) where the mesh adapts to local height/curvature and the
+continuous path realizes a *smooth dose gradient* rather than a stack of
+binary layers. That is a capability, not a compromise — staircase-free
+grayscale topography is hard for layer-thinking pipelines, and it is
+plausibly the most important structure class for applications (optics,
+wetting, photonics).
+
+This strengthens rather than weakens the combination, because smooth
+surfaces are also exactly where *this* repo's physics is most powerful:
+
+- **The density stage becomes near-closed-form.** For a smooth target
+  height field, stage (1) of §9.2 is a *linear deconvolution*:
+  `ŵ(k) = Ĥ_target(k) / K̂(k)` with Tikhonov/Wiener regularization
+  (§6.1's kernel `K = M ⊛ G`). Smooth wave surfaces concentrate their
+  energy at low spatial frequencies, where the kernel's transfer function
+  is strong — so the inversion is well-conditioned precisely for this
+  structure class, and the kernel MTF *predicts, in advance, which surface
+  wavelengths are achievable* (roughly: features broader than the
+  aperture + diffusion footprint invert cleanly; shorter wavelengths need
+  regularization and lose amplitude). That analysis costs one FFT and would
+  make a strong feasibility figure for a joint manuscript.
+- **Acceleration of their loop.** The parallel pipeline validates candidate
+  meshes/paths against the deposition simulation post-hoc. The batched
+  spectral forward (§7.1, microseconds per evaluation, with gradients)
+  turns that post-hoc check into an in-loop objective: mesh density, dwell
+  assignment, and path parameters can be optimized closed-loop against the
+  target surface instead of verified after the fact.
+- **Prior trajectories in discrete point space.** The output of the density
+  stage — and of the analytical/retrieval priors (§3, §8.3) — is a weighted
+  discrete point set {(θᵢ, φᵢ, wᵢ)}: exactly the vertex/waypoint input
+  their mesher and planner consume. So this repo's role in the combined
+  pipeline is concrete: hand their constructor a physics-optimal discrete
+  point cloud (with dwell weights) as initialization, instead of uniform or
+  geometry-derived sampling. The division is then natural — *we supply the
+  points and how long to spend at them; their meshing supplies the
+  continuous surface-respecting realization.*
+
+### 9.6 Division of labor for a follow-up paper
 
 A natural joint contribution ("differentiable inverse design of
 molecular-beam trajectories") assembles: spectral differentiable physics
