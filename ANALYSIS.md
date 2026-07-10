@@ -287,3 +287,158 @@ files are **not mutually consistent** and cannot run in this repository.
 6. **Document the deliberate oddities** (softmax-free attention, weight-tied
    encoder, per-point normalization) in docstrings — they read as bugs until
    explained, and they are the parts a reviewer will ask about.
+
+---
+
+## 6. Feasibility & strategy: is the forward CV model the right tool?
+
+This section addresses the strategic question directly: *does a learned
+forward surrogate make sense for this problem at all, and where should the
+learning effort actually go (property prediction, 3D curvature matching)?*
+
+### 6.1 The uncomfortable observation: the current physics is linear
+
+In `mbhl/simulation.py` the forward map is
+
+```
+F(trajectory) = histogram2d of displacements  R_i = (D+δ)·tan(φ_i)·(cos θ_i, sin θ_i)
+                then Gaussian diffusion blur                    (generate_F, lines 384-471)
+Deposition    = fftconvolve(stencil M, F)                       (simulate_fftconvolve)
+```
+
+So the deposition is **exactly a sum of shifted copies of one fixed kernel**
+`K = M ⊛ G_diffusion`:
+
+```
+D(x) = Σ_i K(x − R_i)
+```
+
+It is *linear in the trajectory point measure* and *smooth in each point's
+(θ, φ)*. Two consequences:
+
+1. **A differentiable physics forward model is ~50 lines of PyTorch**, not a
+   25M-parameter U-Net. Precompute `K̂(k) = M̂(k)·Ĝ(k)` once per stencil,
+   then `D̂(k) = K̂(k)·Σ_i exp(−i k·R_i)` via the Fourier shift theorem —
+   exact forward values, exact analytic gradients w.r.t. every (θ_i, φ_i),
+   no training data, no generalization error, batch-parallel on GPU, and
+   trivially correct against the numpy implementation.
+2. **The U-Net is being asked to memorize a convolution.** All the
+   architectural machinery (set attention, periodic coordinate maps,
+   count gating) exists to approximate an operation the simulator performs
+   exactly in milliseconds. The surrogate can only ever be *worse* than the
+   physics here — the usual surrogate justifications (speed, or
+   differentiability of an otherwise black-box simulator) do not hold,
+   because the simulator is already fast *and* analytically differentiable.
+
+**Recommendation:** for inverse design against the *current* physics,
+replace the learned forward model with a differentiable-physics
+reimplementation and keep the rest of the student's pipeline unchanged —
+the analytical prior → gradient refinement → N-search structure carries
+over verbatim, just with exact gradients instead of surrogate gradients.
+Estimated effort: 1–2 weeks including numerical validation against `mbhl`.
+This also eliminates the entire class of surrogate-hallucination failure
+modes during optimization (the optimizer exploiting regions where the
+network extrapolates badly — a known risk that the current pipeline
+mitigates only by the final physics check).
+
+### 6.2 Where a learned model *does* make sense
+
+The surrogate becomes the right tool exactly where the cheap linear physics
+stops being the truth. In this repo those places are already visible:
+
+- **Shadowing and thickness effects** — the SI notebooks
+  (`SI-fig19-shadowing`, `SI-fig21/22-shadowing-error`,
+  `SI-fig23-thickness-increase`) quantify systematic *nonlinear* deviations
+  from the ideal convolution model (aperture shadowing at large φ,
+  progressive stencil clogging). A network that learns the *residual*
+  between ideal convolution and shadowing-corrected simulation (or
+  experiment) is a genuinely useful surrogate: small, data-efficient, and
+  it composes with the exact linear term.
+- **Sim-to-real (AFM morphology)** — `fig4-AFM-simulation` compares
+  simulation to measured AFM data. A learned map from ideal deposition
+  → measured 3D morphology is the highest-value learning problem in this
+  project, because *no* cheap physics exists for it. This is also the
+  natural home for the student's encoder work.
+- **Amortized inverse design** — a network that maps target → trajectory
+  directly (set transformer / conditional diffusion over point sets) makes
+  sense once many inverse queries must be answered fast. That is a
+  months-scale research project and only worth it after the
+  optimization-based pipeline works end to end.
+
+### 6.3 Property-prediction head on the learned space
+
+Adding a feed-forward property head on the shared encoder (bottleneck →
+MLP → scalar/vector properties) is cheap (days of work) and multi-task
+training may regularize the representation. But apply a simple test first:
+
+> **If the property is computable from the deposition/height field, don't
+> learn it — compute it differentiably downstream.**
+
+Mean/Gaussian curvature of the 2.5D height field, feature width, contrast,
+connectivity proxies, spectral content — all are closed-form (Sobel-like
+derivative stencils for curvature) and can be implemented as fixed
+differentiable PyTorch ops on top of the (exact or learned) forward output.
+A learned head only earns its place when the property is (a) expensive to
+compute (full optical/mechanical response requiring FDTD/FEM), or (b) only
+observable experimentally (measured AFM curvature, adhesion, optical
+scattering). In case (b) the head should hang off *measured-data*
+training, i.e. the sim-to-real model of §6.2 — that is where the learned
+space genuinely pays off.
+
+### 6.4 Inverse design against properties / 3D curvature
+
+Currently the backward pipeline matches the target **image** (geometry).
+Upgrading to property/curvature matching is structurally easy once the
+forward map is differentiable end to end:
+
+```
+trajectory → forward (physics or surrogate) → height field
+           → differentiable property extractor (curvature, etc.)
+           → loss vs target property → ∇ back to trajectory
+```
+
+- With the differentiable physics of §6.1 plus a curvature operator
+  (second-derivative filters on the height field), this is **feasible now**
+  at roughly the same effort as fixing the current pipeline (~2–3 weeks
+  total). One practical caveat: the current deposition map is a *dose*
+  field resized to 256²; converting dose → physical height (including the
+  thickness-increase correction from SI-fig23) needs to be part of the
+  chain before curvature is physically meaningful.
+- **Ill-posedness is the real new difficulty**, not differentiability: a
+  low-dimensional property target (e.g. "mean curvature = X on the ridges")
+  admits many trajectories. Expect the optimizer to find degenerate
+  solutions unless regularized. The student's analytical prior is exactly
+  the right countermeasure and generalizes: keep an image-space or
+  prior-likelihood term in the loss as a regularizer alongside the property
+  term, and/or optimize within the four parametric trajectory families of
+  `Dataset.py` (few parameters, physically realizable, machine-executable)
+  instead of free point clouds. Free-point optimization also produces
+  trajectories a real stage may not be able to execute — a smoothness /
+  max-slew penalty is cheap to add.
+- **True 3D curvature** (undercuts, resist sidewalls, growth dynamics —
+  beyond a 2.5D height field) is not reachable from the current simulation
+  layer at all; that requires either extending the physics or the
+  sim-to-real model of §6.2. Treat it as a separate project phase.
+
+### 6.5 Suggested effort allocation
+
+| Option | Effort | Risk | Verdict |
+|---|---|---|---|
+| Fix current surrogate pipeline to running state (§5 items 1–2) | ~1 week | low | Do regardless — it is the student's baseline and the comparison point for the paper. |
+| Differentiable-physics forward + property extractors | 1–2 weeks | low | **Do first.** Likely obsoletes the surrogate for current-physics inverse design; exact gradients, zero data. |
+| Property head on existing encoder (sim-derived properties) | days | low | Skip unless the property is expensive — compute it downstream instead (§6.3). |
+| Property/curvature-matched inverse design (2.5D) | 2–3 weeks on top of the above | medium (ill-posedness) | High value; reuse the analytical prior as regularizer. |
+| Learned residual for shadowing/thickening | weeks, needs data gen | medium | Good student project; first place the surrogate beats pure physics. |
+| Sim-to-real AFM morphology model | months, needs measured data | high | Biggest scientific payoff; where the CV/encoder investment truly belongs. |
+| Amortized inverse network (target → trajectory) | months | high | Defer until the optimization-based pipeline is a working baseline. |
+
+**Bottom line:** the student's forward U-Net, as an approximation of the
+current linear physics, is hard to justify on technical grounds — a
+differentiable reimplementation of the physics dominates it for inverse
+design. But the *pipeline around it* (analytical prior, refinement loop,
+physics-in-the-loop validation) is the durable contribution and transfers
+unchanged. The learned-model effort should be redirected to where physics
+is genuinely missing — shadowing/thickening residuals and especially
+AFM-measured 3D morphology — and property/curvature matching should be
+built as differentiable operators on top of the forward map rather than as
+new learning problems.
