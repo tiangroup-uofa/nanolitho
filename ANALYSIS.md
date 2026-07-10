@@ -569,3 +569,83 @@ Layers 0–1 alone already replace the current U-Net for inverse design.
   `mbhl`): workable, but the histogram binning and `int(σ)` quantization
   are non-differentiable/piecewise-constant operations that would have to
   be replaced anyway — at which point one has rebuilt Layer 0.
+
+---
+
+## 8. Salvage value of the image2image model: the latent space
+
+Replacing the U-Net as the *forward operator* (§6–7) does not write off the
+training investment. A model trained on tens of thousands of
+(stencil, trajectory) → deposition pairs has learned a representation of
+MBHL pattern space, and that representation has several concrete second
+lives. The honest framing: **the forward-surrogate training was simulation
+pretraining** — the product is not the predicted image, it is the encoder.
+
+One caveat frames everything below. The latent was trained on the *ideal
+linear physics*, so any knowledge it encodes is a lossy compression of what
+the spectral core computes exactly. Its value is therefore never "it knows
+the physics" — it is (a) a data-efficient starting point for tasks where
+labels are scarce, and (b) a structured similarity metric over pattern
+space. Ranked by value-per-effort:
+
+1. **Pretrained trunk for the data-scarce tasks (highest value).** The
+   shadowing residual and AFM sim-to-real models of §6.2 will have
+   hundreds, not tens of thousands, of samples. Fine-tuning from the
+   forward-trained encoder (`enc1–enc3`, and the per-point trajectory
+   embeddings from `traj_gte`/`combined_gte` for set-conditioned residuals)
+   is exactly the transfer-learning pattern that makes such sample counts
+   workable. The student's `load_weights` (shape-checked partial loading)
+   and `freeze_for_settransformer` (encoder freezing) were visibly built
+   for this workflow already. This is the strongest argument that the work
+   was scaffolding, not waste.
+
+2. **Domain-specific perceptual loss in the inverse loop (cheapest win).**
+   Pixel MSE is a poor metric for periodic patterns (translation-sensitive,
+   blind to structure); MS-SSIM only partly compensates. Reusing the frozen
+   encoder as a feature-matching loss — compare encoder activations of
+   prediction vs. target, VGG-perceptual-loss style but native to
+   lithography patterns — drops into `refine_trajectory` with ~10 lines and
+   works identically on top of the spectral physics core. This directly
+   serves the property/curvature-matching goal (§6.4), where good pattern
+   metrics matter more than pixel agreement.
+
+3. **Retrieval-based initialization, complementing the analytical prior.**
+   Embed the training set once (pooled bottleneck vectors), and at inverse-
+   design time retrieve nearest neighbors of the target pattern — their
+   stored trajectories are initializations that come from the *data*
+   rather than from the prior's geometric assumptions (single central
+   aperture, clean ring), so they cover exactly the cases where the
+   analytical prior degrades (overlapping deposition from multiple
+   apertures, dense honeycomb interference). A day of work with the
+   existing checkpoint.
+
+4. **Out-of-distribution / trust scoring during optimization.** Latent
+   distance to the training manifold flags when an optimizer has pushed a
+   design into territory where the *learned residual* (Layer 2) — and later
+   the experimental calibration — cannot be trusted. Added as a soft
+   penalty, it keeps property-matched inverse design (which is ill-posed
+   and will exploit any model, §6.4) inside the validated envelope. Note
+   this is a safeguard for the learned components, not for the exact
+   physics core, which needs none.
+
+5. **Latent generative prior over stencils (only if free-form design
+   happens).** If stencil design ever goes beyond the ~5-parameter lattices
+   to free-form topology (§7.1), a generative model (VAE/diffusion) in or
+   near this latent space provides the manufacturability prior that
+   free-form optimization otherwise lacks. Real value, but contingent on a
+   design-space decision that has not been made — do not build it
+   speculatively.
+
+Two practical notes. First, the U-Net latent is spatially structured
+(32×32×256 bottleneck), which is ideal for the dense tasks (1) and (2);
+global uses (3)–(4) should pool it — the existing `stencil_token` head is
+that pooling. Second, if representation quality ever becomes the goal in
+itself, masked-autoencoder or contrastive pretraining on the simulation
+data would likely beat forward-map pretraining — but the forward-trained
+checkpoint is already paid for, and items (1)–(4) can be built on it as-is.
+
+**Bottom line:** keep the checkpoint, retire the *role*. The network's job
+was never to out-compute an FFT; its encoder is the down payment on the
+experiment-facing models where learning is genuinely needed, and its latent
+space supplies the pattern-similarity metric, initialization source, and
+trust region that the exact-physics inverse pipeline lacks on its own.
