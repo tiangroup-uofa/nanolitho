@@ -442,3 +442,130 @@ is genuinely missing — shadowing/thickening residuals and especially
 AFM-measured 3D morphology — and property/curvature matching should be
 built as differentiable operators on top of the forward map rather than as
 new learning problems.
+
+---
+
+## 7. Proposed architecture for the differentiable forward model
+
+Premise: the stencil representation is a free choice (full 2D image, or
+parametric lattice + aperture). Under that freedom, the recommended design
+is a **spectral (Fourier-multiplier) physics core with an optional neural
+residual operator on top** — three layers, each independently useful.
+
+### 7.1 Layer 0 — closed-form spectral physics core
+
+The entire ideal forward map factorizes as a *product of closed-form
+Fourier multipliers*, because the deposition is a convolution chain:
+
+```
+D̂(k) = M̂(k) · Ĝ(k) · T̂(k)                 then one inverse FFT
+        │        │        │
+        │        │        └─ trajectory factor:  T̂(k) = Σᵢ wᵢ·exp(−i k·Rᵢ)
+        │        │           Rᵢ = (D+δ)·tan(φᵢ)·(cos θᵢ, sin θᵢ) + drift
+        │        └─ diffusion factor:  Ĝ(k) = exp(−|k|²σ²/2)
+        └─ stencil factor (either representation, see below)
+```
+
+Every factor is analytic and smooth in **all** physical parameters, so a
+PyTorch implementation gives exact autograd gradients w.r.t. trajectory
+points (θᵢ, φᵢ), per-point dwell weights wᵢ, diffusion σ, drift, *and* the
+stencil parameters — enabling joint stencil+trajectory co-design, which the
+current pipeline cannot do at all.
+
+The stencil factor `M̂(k)` is where the representation freedom lives, and
+the spectral core is agnostic to the choice:
+
+- **Parametric (recommended default).** A periodic lattice of identical
+  apertures factorizes further into *form factor × structure factor*:
+  `M̂(k) = A(k; shape) · Σⱼ exp(−i k·cⱼ)` over the basis centers cⱼ of the
+  unit cell. The form factors are textbook closed forms — circle:
+  jinc `2πr²·J₁(|k|r)/(|k|r)`; rectangle/square: `w·h·sinc(kₓw/2)·sinc(k_y h/2)`
+  with rotation applied by rotating k. All four lattices in `Dataset.py`
+  (square / hexagonal / honeycomb / diamond) are just different basis-center
+  tables — exactly the structure the student already encoded. Smooth in
+  r, w, h, rotation, and lattice constant L. ~5 designable scalars, always
+  manufacturable, no rasterization anywhere.
+- **Image / free-form.** When topology freedom is wanted (topology-
+  optimization-style stencil design), represent the aperture by a signed
+  distance function or density field ρ and soft-binarize
+  `M = σ((−SDF)/τ)` with temperature annealing on τ, then FFT. Standard
+  practice from differentiable rendering / topology optimization; needs
+  a manufacturability regularizer (minimum feature size = a cap on |∇ρ|
+  or an opening/closing penalty).
+- Since both routes just produce `M̂(k)`, they can coexist behind one
+  interface; start parametric, add free-form only if a design study needs
+  it.
+
+Bonus corrections over the current numpy implementation, for free:
+
+- `generate_F` histograms displacements into pixel bins
+  (`simulation.py:449-467`) — the phase factor `exp(−i k·Rᵢ)` places points
+  with *exact sub-pixel* positions, removing quantization noise from both
+  values and gradients.
+- The FFT path quantizes diffusion to whole pixels
+  (`sigma = int(diffusion/h)`, `simulation.py:469`) — `Ĝ(k)` uses the exact
+  continuous σ (and note the other code paths at lines 709/787 already use
+  float σ, so the current package is internally inconsistent here).
+- Brillouin-zone folding becomes exact circular convolution on the unit
+  cell (periodic FFT), rather than explicit index folding.
+
+Cost: one batched inverse FFT per forward; microseconds on GPU; ~50–100
+lines. Validate against `mbhl` numerically (expect agreement to within the
+histogram/σ quantization of the original).
+
+### 7.2 Layer 1 — differentiable trajectory parameterization
+
+For inverse design, optimize not only free point clouds but the compact
+parametric families already defined in `Dataset.py` (`smooth`, `stepwise`,
+`harmonic`): Fourier coefficients of φ(θ), segment levels, etc. All map
+smoothly into the Rᵢ of Layer 0. Free points maximize expressiveness but
+produce stage-unexecutable trajectories; the parametric families are the
+regularization (§6.4) *and* the manufacturability constraint in one. Dwell
+weights wᵢ (continuous, positive, simplex-normalized) subsume the discrete
+"number of points N" search — replacing golden-section over integer N with
+smooth optimization + sparsity penalty on w.
+
+### 7.3 Layer 2 — neural residual operator (only where physics ends)
+
+For shadowing/thickening/sim-to-real (§6.2), learn only the *residual*
+around the exact linear term:
+
+```
+D = D_linear  +  f_θ( D_linear, conditioning maps )
+```
+
+Architecture choice for f_θ: a **Fourier Neural Operator (FNO)** — the
+natural pick because the ideal operator *is* a Fourier multiplier, so FNO's
+spectral convolutions contain the truth as a special case and the network
+only has to learn the deviation; it is also resolution/discretization-
+invariant, which fits the resize-to-256² pipeline and lets one model serve
+multiple mesh densities. A plain shallow CNN/U-Net residual is an
+acceptable simpler fallback. Conditioning channels should carry the physics
+the residual actually depends on: per-pixel incident-angle maps (the
+φ-weighted dose from Layer 0's factorization), aperture edge distance/
+orientation (from the SDF — another argument for the parametric/SDF
+stencil), and cumulative dose for thickening dynamics. If the stencil is
+parametric, its ~5 scalars enter via FiLM-style modulation of the residual
+blocks — a hypernetwork is overkill at this parameter count.
+
+Layer 2 is trained on shadowing-corrected simulations or AFM data
+(hundreds of samples suffice for a residual, vs. the tens of thousands a
+full surrogate needs), and is simply omitted until those datasets exist —
+Layers 0–1 alone already replace the current U-Net for inverse design.
+
+### 7.4 Why not the alternatives
+
+- **Full neural surrogate (current U-Net, or FNO trained end-to-end):**
+  learns what Layer 0 computes exactly; pays data, training, and
+  hallucination costs for negative accuracy benefit (§6.1).
+- **DeepONet / hypernetwork over stencil params:** sensible for parametric-
+  only stencils, but strictly less general than the multiplier
+  factorization, which handles image stencils through the same interface.
+- **Differentiable ray tracer** (mirroring `simulate_raytracing`): correct
+  but slow and gradient-noisy; only needed if membrane-thickness effects at
+  large φ must be exact, and even then better handled as a Layer 2 residual
+  trained on ray-traced data.
+- **Autodiff through the existing numpy code** (e.g. via JAX rewrite of
+  `mbhl`): workable, but the histogram binning and `int(σ)` quantization
+  are non-differentiable/piecewise-constant operations that would have to
+  be replaced anyway — at which point one has rebuilt Layer 0.
