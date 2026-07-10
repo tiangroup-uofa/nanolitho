@@ -649,3 +649,110 @@ was never to out-compute an FFT; its encoder is the down payment on the
 experiment-facing models where learning is genuinely needed, and its latent
 space supplies the pattern-similarity metric, initialization source, and
 trust region that the exact-physics inverse pipeline lacks on its own.
+
+---
+
+## 9. Combining with space-filling-curve inverse design (parallel MB-3DP work)
+
+Context: a parallel manuscript (collaborating group) builds arbitrary 2.5D
+structures layer-by-layer: target model → adaptive slicing → per-slice
+point set → a learned/heuristic *coverage path* (space-filling-curve-style
+planning) that connects the points into a continuous executable
+trajectory, checked afterwards against the deposition simulation. Their
+"inverse design" is thus combinatorial path planning after a heuristic
+slicing step; this repo's is continuous optimization with a physics prior.
+The two are not competitors — they solve **different halves of the same
+factorization**, and the clean combination falls out of one observation.
+
+### 9.1 The key structural fact: ordering doesn't enter the physics
+
+For the (ideal) linear forward map (§6.1), the deposition depends on the
+trajectory **only through its dwell measure** — how much beam time lands
+at each (θ, φ) / each lateral offset — and not at all on the *order* in
+which the trajectory visits those points. The inverse problem therefore
+factorizes exactly:
+
+```
+(1) DENSITY:  target pattern/height  →  dwell-density map  w(θ, φ)
+              — continuous, physical, differentiable  → gradient methods
+(2) ORDERING: dwell density  →  continuous executable path
+              — combinatorial, kinematic, physics-free → space-filling curves
+```
+
+Today each group is solving one stage and improvising the other. The
+slicing+path pipeline answers (2) well but answers (1) with a lossy
+heuristic (slicing) and optimizes path-geometry proxies (turn count,
+crossings) that stand in for deposition uniformity — the softest spot in
+that manuscript. This repo answers (1) well (prior + gradient refinement,
+exactly the "regularized / low-sample" strength) but produces an
+*unordered point set with no executability guarantee* — its softest spot.
+Each pipeline's weakness is the other's core competence.
+
+### 9.2 The combined pipeline
+
+```
+target 2.5D height map / property map
+   → per-layer dwell-density optimization          [this repo: spectral
+     via differentiable physics + priors            core §7 + prior §3,
+     (+ learned residual for shadowing/clogging)    residual §7.3/§8]
+   → density realization as a continuous path      [parallel work:
+     (variable-pitch Fermat spiral / Hilbert-type   space-filling planner —
+     fill whose local pitch/speed ∝ w)              their planner slots in]
+   → physics / experimental validation
+```
+
+Stage (1) subsumes several existing pieces: the dwell weights wᵢ of §7.2
+*are* the density unknowns; the analytical prior (§3) and its retrieval
+complement (§8.3) initialize it; the discrete "number of points N" search
+disappears into continuous density mass. Stage (2) is precisely the
+halftoning/stippling → continuous-path problem that variable-pitch
+connected Fermat spirals were designed for, and any planner (deterministic
+or learned) can be used — it now optimizes only executability (curvature,
+continuity, stage limits) because *fidelity was already guaranteed
+upstream*. This also gives the parallel manuscript's planner a principled
+objective for free: instead of hand-tuned geometric reward terms, score a
+candidate path by pushing its induced dwell density through the
+differentiable forward model — a dense, physical reward signal.
+
+### 9.3 Where ordering genuinely re-enters: the honest boundary
+
+The factorization is exact only for the linear physics. History-dependent
+effects — stencil clogging (deposition accumulating on the membrane
+narrows apertures over time; SI-fig23), thermal load, evolving gap — make
+the outcome depend on *when*, not just *how much*. That is precisely the
+regime where (a) the learned residual operator (§7.3) must take cumulative
+dose as input, and (b) sequencing becomes a real optimization variable, the
+one place a learned/RL planner has a defensible advantage over a
+deterministic space-filling heuristic — *provided its reward comes from
+the differentiable simulator rather than geometric proxies*. The
+recommended claim structure for any joint work: deterministic
+density+curve pipeline as the strong baseline; sequential/learned planning
+introduced only where history dependence is demonstrated to matter.
+
+### 9.4 Shared application targets fit the density altitude natively
+
+The application directions discussed for the parallel work — percolation-
+threshold films (designed fill fraction ≈ designed connectivity),
+grain-size/texture patterning via local flux and dwell statistics,
+deliberate sub-resolution gap networks — are all **statements about the
+dwell-density field, not about any particular path**. They are therefore
+property-matched inverse design (§6.4) in stage (1): differentiable
+observables (coverage fraction, connectivity proxies, local dose rate)
+regularized by the prior, with stage (2) realizing whatever density the
+optimizer finds. This is worth emphasizing in any joint framing: the
+density/ordering factorization is not just an implementation convenience,
+it is what makes "target microstructure/connectivity map → trajectory" a
+well-posed, low-sample problem at all.
+
+### 9.5 Division of labor for a follow-up paper
+
+A natural joint contribution ("differentiable inverse design of
+molecular-beam trajectories") assembles: spectral differentiable physics
+core + dwell-density optimization with analytical/retrieval priors (this
+group); shadowing/clogging residual fine-tuned on the collaborators' AFM
+data (§6.2, using the pretrained encoder of §8); their space-filling
+planner as the density-realization stage and their experimental system for
+validation. Each group's published/mature work is cited as-is; neither
+pipeline needs to be re-litigated. The ablation that a reviewer will want
+— end-to-end density+curve vs. slicing+planning-only — is then the paper's
+central comparison rather than an awkward criticism of either parent work.
