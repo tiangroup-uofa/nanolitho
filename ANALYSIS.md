@@ -788,7 +788,46 @@ surfaces are also exactly where *this* repo's physics is most powerful:
   points and how long to spend at them; their meshing supplies the
   continuous surface-respecting realization.*
 
-### 9.6 Division of labor for a follow-up paper
+### 9.6 Sidebar: RL vs. Bayesian optimization — when each is the right tool
+
+Two optimizers keep coming up across the two projects; they solve
+different problem shapes and should not be treated as substitutes.
+
+**Bayesian optimization** fits a GP surrogate over a *fixed, small
+parameter vector* and picks evaluations by an acquisition function. It is
+the right tool at ~5–50 dimensions with expensive evaluations (experiments,
+slow simulations), gives calibrated uncertainty, and outputs *one design*.
+**RL** learns a *policy* for sequential decisions and outputs a *reusable
+controller*. Its real advantages over BO are exactly: (1) native handling
+of combinatorial/variable-length decision sequences (path ordering cannot
+be flattened into a GP's input vector), (2) amortization — a trained
+policy transfers to new geometries without re-optimizing, and (3)
+long-horizon credit assignment when physics is history-dependent
+(clogging/thermal — the §9.3 boundary). Its costs: 10⁵–10⁷ simulated
+rollouts (impossible against experiments), hyperparameter fragility, and a
+tendency toward hand-tuned proxy rewards.
+
+Decision rule for this project, per the §9 factorization:
+
+| Problem | Shape | Tool |
+|---|---|---|
+| Dwell density, trajectory-family coefficients | continuous, differentiable via spectral core | gradients (neither BO nor RL) |
+| Process/experiment knobs, regularizer weights | low-dim, expensive, non-differentiable | Bayesian optimization |
+| Path ordering | combinatorial, cheap simulator | deterministic planners first; RL only if history dependence is demonstrated, with the differentiable simulator as reward |
+
+**Standard Python training stack for the RL case:** Gymnasium for the
+environment API + Stable-Baselines3 for PPO/SAC/DQN; action masking for
+"visit each point once" problems via sb3-contrib's `MaskablePPO` (very
+likely what the parallel work's "MPPO" denotes); RL4CO / pointer-network
+(attention) policies as the modern baseline for TSP/coverage-style
+combinatorial problems; CleanRL for modifiable single-file
+implementations; Ray RLlib only when distributed throughput becomes the
+bottleneck. Practicalities that dominate outcomes: vectorized environments
+(env speed, not the GPU, is the bottleneck), curriculum over instance
+size + geometry randomization for any generalization claim, and Optuna
+(itself BO) for RL hyperparameters.
+
+### 9.7 Division of labor for a follow-up paper
 
 A natural joint contribution ("differentiable inverse design of
 molecular-beam trajectories") assembles: spectral differentiable physics
